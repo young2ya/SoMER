@@ -6,3 +6,17 @@ result/
 plot/
 
 *.xlsx
+
+# 데이터셋 폴더
+CWRU_64/
+CWRU_STFT_64/
+HUST_64/
+HUST_64_fulldataset/
+PU_64/
+PU_64_onlyelectric/
+STFT_64/
+STFT_128/
+data_stft_64/
+
+# 사용 안 하는 코드
+scatch.py

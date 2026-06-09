@@ -5,33 +5,138 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-###################CNN
-class CNN(nn.Module):
+
+################### CNN
+class CNN_128(nn.Module):
     def __init__(self, num_classes):
-        super(CNN, self).__init__()
+        super(CNN_128, self).__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(1,32,5,padding=2),
-            nn.ReLU(),
-            nn.MaxPool2d(2,2),
+            nn.Conv2d(1, 32, 5, padding=2),
+            nn.Tanh(),
+            nn.MaxPool2d(2, 2),
 
             nn.Conv2d(32, 64, 5, padding=2),
-            nn.ReLU(),
-            nn.MaxPool2d(2,2),
+            nn.Tanh(),
+            nn.MaxPool2d(2, 2),
 
             nn.Conv2d(64, 128, 5, padding=2),
-            nn.ReLU(),
-            nn.MaxPool2d(2,2))
+            nn.Tanh(),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(128, 128, 5, padding=2),
+            nn.Tanh(),
+            nn.MaxPool2d(2, 2))
 
         self.classifier = nn.Sequential(
-            nn.Linear(128*8*8, 1024), nn.ReLU(),
-            nn.Linear(1024, 512), nn.ReLU(),
-            nn.Linear(512, num_classes))
+            nn.Linear(128 * 8 * 8, 1024), nn.Tanh(),
+            nn.Linear(1024, 256), nn.Tanh())
+        self.fc = nn.Linear(256, num_classes)
 
     def forward(self, x):
         x = self.features(x)
-        x = x.view(-1, 128*8*8)
+        x = x.view(-1, 128 * 8 * 8)
         x = self.classifier(x)
-        return x
+        return x, self.fc(x)
+
+
+class _CNN_64(nn.Module):
+    def __init__(self, num_classes):
+        super(CNN_64, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 32, 5, padding=2),
+            nn.LeakyReLU(),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(32, 64, 5, padding=2),
+            nn.LeakyReLU(),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(64, 128, 5, padding=2),
+            nn.LeakyReLU(),
+            nn.MaxPool2d(2, 2))
+
+        self.classifier = nn.Sequential(
+            nn.Linear(128 * 8 * 8, 1024), nn.LeakyReLU(),
+            nn.Linear(1024, 256), nn.LeakyReLU())
+        self.fc = nn.Linear(256, num_classes)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = x.view(-1, 128 * 8 * 8)
+        x = self.classifier(x)
+        return x, self.fc(x)
+
+class CNN_64(nn.Module):
+    def __init__(self, num_classes):
+        super(CNN_64, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 32, 5, padding=2),
+            nn.Tanh(),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(32, 64, 5, padding=2),
+            nn.Tanh(),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(64, 128, 5, padding=2),
+            nn.Tanh(),
+            nn.MaxPool2d(2, 2))
+
+        self.classifier = nn.Sequential(
+            nn.Linear(128 * 8 * 8, 1024), nn.Tanh(),
+            nn.Linear(1024, 256), nn.Tanh())
+        self.fc = nn.Linear(256, num_classes)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = x.view(-1, 128 * 8 * 8)
+        x = self.classifier(x)
+        return x, self.fc(x)
+
+# CNN + Attention
+class AttentionCNN_64(nn.Module):
+    def __init__(self, num_classes):
+        super(AttentionCNN_64, self).__init__()
+
+        self.feature = nn.Sequential(
+            nn.Conv2d(1, 32, 5, padding=2),
+            nn.Tanh(),
+            nn.MaxPool2d(2,2),
+
+            nn.Conv2d(32, 64, 5, padding=2),
+            nn.Tanh(),
+            nn.MaxPool2d(2,2),
+
+            nn.Conv2d(64, 128, 5, padding=2),
+            nn.Tanh(),
+            nn.MaxPool2d(2,2)
+        )
+
+        self.attention = nn.Sequential(
+            nn.Conv2d(128, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(128 * 8 * 8, 1024), nn.Tanh(),
+            nn.Linear(1024, 256), nn.Tanh()
+        )
+
+        self.fc = nn.Linear(256, num_classes)
+
+    def forward(self, x):
+        feature_map = self.feature(x)
+
+        attention_map = self.attention(feature_map)
+
+        attended_features = feature_map * attention_map
+
+        x = attended_features.view(-1, 128 * 8 * 8)
+
+        x = self.classifier(x)
+
+        return x, self.fc(x)
+
 
 ########################WRN
 class BasicBlock(nn.Module):
@@ -48,7 +153,7 @@ class BasicBlock(nn.Module):
         self.droprate = dropRate
         self.equalInOut = (in_planes == out_planes)
         self.convShortcut = (not self.equalInOut) and nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride,
-                               padding=0, bias=False) or None
+                                                                padding=0, bias=False) or None
         self.activate_before_residual = activate_before_residual
 
     def forward(self, x):
@@ -62,26 +167,30 @@ class BasicBlock(nn.Module):
         out = self.conv2(out)
         return torch.add(x if self.equalInOut else self.convShortcut(x), out)
 
+
 class NetworkBlock(nn.Module):
 
     def __init__(self, nb_layers, in_planes, out_planes, block, stride, dropRate=0.0, activate_before_residual=False):
         super(NetworkBlock, self).__init__()
-        self.layer = self._make_layer(block, in_planes, out_planes, nb_layers, stride, dropRate, activate_before_residual)
+        self.layer = self._make_layer(block, in_planes, out_planes, nb_layers, stride, dropRate,
+                                      activate_before_residual)
 
     def _make_layer(self, block, in_planes, out_planes, nb_layers, stride, dropRate, activate_before_residual):
         layers = []
         for i in range(int(nb_layers)):
-            layers.append(block(i == 0 and in_planes or out_planes, out_planes, i == 0 and stride or 1, dropRate, activate_before_residual))
+            layers.append(block(i == 0 and in_planes or out_planes, out_planes, i == 0 and stride or 1, dropRate,
+                                activate_before_residual))
         return nn.Sequential(*layers)
 
     def forward(self, x):
         return self.layer(x)
 
+
 class WideResNet(nn.Module):
     def __init__(self, num_classes, depth=28, widen_factor=2, dropRate=0.0):
         super(WideResNet, self).__init__()
-        nChannels = [16, 16*widen_factor, 32*widen_factor, 64*widen_factor]
-        assert((depth - 4) % 6 == 0)
+        nChannels = [16, 16 * widen_factor, 32 * widen_factor, 64 * widen_factor]
+        assert ((depth - 4) % 6 == 0)
         n = (depth - 4) / 6
         block = BasicBlock
         # 1st conv before any network block
@@ -116,9 +225,11 @@ class WideResNet(nn.Module):
         out = self.block2(out)
         out = self.block3(out)
         out = self.relu(self.bn1(out))
-        out = F.avg_pool2d(out, 8)
+        out = F.avg_pool2d(out, 8)  # 64x64: 8  / 128x128: 16
         out = out.view(-1, self.nChannels)
-        return self.fc(out)
+
+        return out, self.fc(out)
+
 
 class WeightEMA(object):
     def __init__(self, model, ema_model, alpha, lr):
@@ -135,12 +246,12 @@ class WeightEMA(object):
     def step(self):
         one_minus_alpha = 1.0 - self.alpha
         for param, ema_param in zip(self.params, self.ema_params):
-            if ema_param.dtype==torch.float32:
-
+            if ema_param.dtype == torch.float32:
                 ema_param.mul_(self.alpha)
                 ema_param.add(param * one_minus_alpha)
 
                 param.mul_(1 - self.wd)
+
 
 class ModelEMA(object):
     def __init__(self, args, model, decay):
@@ -175,10 +286,134 @@ class ModelEMA(object):
                     j = k
                 esd[k].copy_(msd[j])
 
+
+###########################################HCAE
+class CAE_128(nn.Module):
+    def __init__(self, num_classes):
+        super(CAE_128, self).__init__()
+        self.features = nn.Sequential(
+
+            nn.Conv2d(1, 32, 5, padding=2),
+            nn.Tanh(),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(32, 64, 5, padding=2),
+            nn.Tanh(),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(64, 128, 5, padding=2),
+            nn.Tanh(),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(128, 128, 5, padding=2),
+            nn.Tanh(),
+            nn.MaxPool2d(2, 2)
+        )
+
+        self.encoder_fc = nn.Sequential(
+            nn.Linear(128 * 8 * 8, 1024), nn.Tanh(),
+            nn.Linear(1024, 256), nn.Tanh()
+        )
+
+        self.classifier = nn.Linear(256, num_classes)
+
+        self.decoder_fc = nn.Sequential(
+            nn.Linear(256, 1024), nn.Tanh(),
+            nn.Linear(1024, 128 * 8 * 8), nn.Tanh()
+        )
+
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(128, 128, 4, stride=2, padding=1),
+            nn.Tanh(),
+
+            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
+            nn.Tanh(),
+
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),
+            nn.Tanh(),
+
+            nn.ConvTranspose2d(32, 1, 4, stride=2, padding=1),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        z = self.features(x)
+        z = z.view(x.size(0), -1)
+        z = self.encoder_fc(z)
+
+        y = self.classifier(z)
+
+        recon = self.decoder_fc(z)
+        recon = recon.view(z.size(0), 128, 8, 8)
+        recon = self.decoder(recon)  
+
+        return recon, y
+
+
+class CAE_64(nn.Module):
+    def __init__(self, num_classes):
+        super(CAE_64, self).__init__()
+
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 32, 5, padding=2),
+            nn.Tanh(),
+            nn.MaxPool2d(2,2),
+
+            nn.Conv2d(32, 64, 5, padding=2),
+            nn.Tanh(),
+            nn.MaxPool2d(2,2),
+
+            nn.Conv2d(64, 128, 5, padding=2),
+            nn.Tanh(),
+            nn.MaxPool2d(2,2)
+        )
+
+        self.encoder_fc = nn.Sequential(
+            nn.Linear(128*8*8, 1024), nn.Tanh(),
+            nn.Linear(1024, 256), nn.Tanh()
+        )
+
+        self.classifier = nn.Linear(256, num_classes)
+
+        self.decoder_fc = nn.Sequential(
+            nn.Linear(256, 1024), nn.Tanh(),
+            nn.Linear(1024, 128*8*8), nn.Tanh()
+        )
+
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
+            nn.Tanh(),
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),
+            nn.Tanh(),
+            nn.ConvTranspose2d(32, 1, 4, stride=2, padding=1),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        z = self.features(x)
+        z = z.view(x.size(0), -1)
+        z = self.encoder_fc(z)
+        y = self.classifier(z)
+
+        recon = self.decoder_fc(z)
+        recon = recon.view(z.size(0), 128, 8, 8)
+        recon = self.decoder(recon)
+
+        return recon, y
+
 def create_model(args):
-    if args.model == 'cnn':
-        model = CNN(num_classes=7)
-    elif args.model == 'wrn':
-        model = WideResNet(num_classes=7)
+    if args.dataset == 'slra':
+        if args.model == 'cnn':
+            if args.method == 'hcae':
+                model = CAE_128(num_classes=args.num_classes)
+            else:
+                model = CNN_128(num_classes=args.num_classes)
+        elif args.model == 'wrn':
+            model = WideResNet(num_classes=args.num_classes)
+    else:
+        if args.method == 'hcae':
+            model = CAE_64(num_classes=args.num_classes)
+        else:
+            model = CNN_64(num_classes=args.num_classes)
     model = model.to(args.device)
     return model
