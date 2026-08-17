@@ -18,17 +18,18 @@ from torch.utils.data import Dataset
 
 
 ############################################################################
-# 1. 데이터 관련 함수 (파일 불러오기, 병합, 슬라이싱 등)
+# 1. Data functions (file loading, merging, slicing, etc.)
 ############################################################################
-### SLRA
-def _npz_Loader(folder_path, each_num):
+### SLRA (the normal (N) class has far more samples than the fault classes,
+### so this loader randomly samples only each_num files per folder to balance class counts)
+def npz_Loader_balanced(folder_path, each_num):
     """
-    주어진 폴더 내 .npz 파일들 중 무작위로 each_num개를 골라 로드하고
-    x, y를 병합하여 반환하는 함수수
+    Randomly picks each_num .npz files from the given folder, loads them,
+    and returns the concatenated x, y (SLRA-only class balancing).
     """
-    # 폴더 안의 .npz 파일 리스트
+    # List .npz files in the folder
     file_names = [os.path.join(folder_path, file) for file in os.listdir(folder_path) if file.endswith(".npz")]
-    # 무작위로 each_num개 샘플링링
+    # Randomly sample each_num files
     file_names = random.sample(file_names, each_num)
 
     npy_list = []
@@ -41,13 +42,13 @@ def _npz_Loader(folder_path, each_num):
         npy_list.append(X)
         label_list.append(y)
 
-    # 하나의 리스트에 쌓은 뒤, 최종적으로 vstack/hstack를 호출출
+    # Collect into lists, then vstack/hstack at the end
     npy_arr = np.vstack(npy_list)
     label_arr = np.hstack(label_list)
 
     return npy_arr, label_arr
 
-### CWRU,hust,pu
+### CWRU, HUST, PU (loads every .npz file in the folder as-is — no class balancing)
 def npz_Loader(folder_path):
     file_names = [os.path.join(folder_path, file) for file in os.listdir(folder_path) if file.endswith(".npz")]
 
@@ -67,6 +68,13 @@ def npz_Loader(folder_path):
 
 
 def slice_data(args, data_dict, label_dict):
+    """
+    Splits each bearing_type's (key's) array into train/test/val/unlabeled
+    slices using fixed-size windows: [0:num_labeled) for train,
+    [num_labeled:num_labeled+val_num) for test,
+    [num_labeled+val_num:num_labeled+2*val_num) for val,
+    and everything after that for unlabeled.
+    """
     train_data, test_data, val_data, unlabel_data, train_label, test_label, val_label, unlabel_label = [{} for i in range(8)]
 
     for key in data_dict.keys():
@@ -86,10 +94,15 @@ def slice_data(args, data_dict, label_dict):
     return (train_data, test_data, val_data, unlabel_data, train_label, test_label, val_label, unlabel_label)
 
 
-def load_npz_files(folder_path_list, each_data_num):
+def load_npz_files(args, folder_path_list):
     """
-    여러 폴더(타입) 경로 목록을 받아,
-    각 폴더마다 npz_loader로 데이터를 불러오고, 딕셔너리 형태로 저장하는 함수
+    Loads npz data from each folder (bearing type) in folder_path_list and
+    stores it in dictionaries.
+
+    The loader is chosen automatically based on args.dataset:
+        - 'slra': npz_Loader_balanced (samples only args.each_data_num files
+          per folder to offset the normal (N) class imbalance)
+        - otherwise: npz_Loader (loads every file in the folder, no balancing)
 
     returns:
         arr_dict: dict[bearing_type] = X_array
@@ -101,8 +114,11 @@ def load_npz_files(folder_path_list, each_data_num):
     for folder_path in folder_path_list:
         bearing_type = os.path.basename(folder_path)
         print(f"Loading bearing type: {bearing_type}...")
-        # X_arr, y_arr = npz_Loader(folder_path=folder_path, each_num=each_data_num)
-        X_arr, y_arr = npz_Loader(folder_path=folder_path)
+
+        if args.dataset == 'slra':
+            X_arr, y_arr = npz_Loader_balanced(folder_path, args.each_data_num)
+        else:
+            X_arr, y_arr = npz_Loader(folder_path)
 
         arr_dict[bearing_type] = X_arr
         label_dict[bearing_type] = y_arr
@@ -111,17 +127,17 @@ def load_npz_files(folder_path_list, each_data_num):
 
 def concat_data(X_dict, y_dict):
     """
-    여러 딕셔너리에 나눠진 데이터를 한 번에 합치는 함수
-    X_dict.values(): 각 bearing_type별 X_array
-    y_dict.values(): 각 bearing_type별 y_array
+    Merges data spread across multiple per-bearing-type dictionaries into one.
+    X_dict.values(): X_array per bearing_type
+    y_dict.values(): y_array per bearing_type
 
-    결과 X, y를 반환하며,
-    X.shape = (..., height, width)에 1채널 차원을 추가 -> 모델 입력을 위해서
+    Returns the concatenated X, y. A channel dimension is appended so
+    X.shape = (..., height, width, 1), ready for the model input format.
     """
     X_concat = np.concatenate(list(X_dict.values()), axis=0)  # (N, H, W)
     y_concat = np.concatenate(list(y_dict.values()), axis=0)  # (N)
 
-    # (N, H, W, 1) 형태로 만들어서 Pytorch의 (N, C, H, W)로 변환하기 쉽게 함
+    # Add a channel dim -> (N, H, W, 1), so it converts cleanly to PyTorch's (N, C, H, W)
     X_concat = X_concat[..., np.newaxis]  # (N, H, W, 1)
     return X_concat, y_concat
 
@@ -130,34 +146,34 @@ def get_global_mean_std(X_train, X_unlab):
     """
     arr_dict: dict[bearing_type] = (N, H, W)
 
-    (train + unlabeled)모든 bearing_type의 X_arr를 한 번에 합쳐서 전체 mean, std를 계산
-    shape: (N, H, W)에 대해 np.mean / np.std를 구함
+    Concatenates train + unlabeled data across all bearing types and computes
+    a single global mean/std over the (N, H, W) array.
     returns:
         (mean, std)
     """
-    # 모든 타입 데이터를 하나로 합치기
+    # Merge all bearing types into one array
     X_all = np.concatenate([X_train, X_unlab], axis=0)
 
     X_2d = X_all[..., 0]
 
-    # 전체 평균/표준편차
+    # Global mean/std
     mean = np.mean(X_2d)
     std = np.std(X_2d)
     return mean, std
 
 
 ############################################################################
-# 2. Dataset 구현
+# 2. Dataset implementation
 ############################################################################
 class BearingDataset(Dataset):
     """
-    기본 Dataset.
+    Base Dataset.
     X_data: (N, H, W, 1) -> permute -> (N, 1, H, W)
     y_data: (N, )
     """
 
     def __init__(self, x_data, y_data, transform=None):
-        # x_data, y_data를 텐서로 변환
+        # Convert x_data, y_data to tensors
         # permute(0,3,1,2) -> (N, C=1, H, W)
         self.x_data = torch.FloatTensor(x_data).permute(0, 3, 2, 1)
         self.y_data = torch.LongTensor(y_data)
@@ -180,8 +196,8 @@ class BearingDataset(Dataset):
 ############################################################################
 class AddGaussianNoise(object):
     """
-    간단한 가우시안 노이즈를 추가하는 증강.
-    mean, std를 적당히 조절 가능
+    Simple additive Gaussian noise augmentation.
+    mean, std can be tuned as needed.
     """
 
     def __init__(self, mean, std):
@@ -194,34 +210,20 @@ class AddGaussianNoise(object):
         return x + noise
 
 
-class AddUniformNoise(object):
-    """
-    Uniform 분포 노이즈
-    """
-
-    def __init__(self, low, high):
-        self.low = low
-        self.high = high
-
-    def __call__(self, x):
-        noise = (self.high - self.low) * torch.rand_like(x) + self.low
-        return x + noise
-
-
 class SpecTimeMask(object):
     """
-    스펙트로그램 시간축 일부 구간을 마스킹하는 증강 기법
+    Augmentation that masks a segment along the spectrogram's time axis.
     x shape : (C, H, W)
-        C: 채널
-        H: 주파수 축
-        W: 시간 축
+        C: channel
+        H: frequency axis
+        W: time axis
     """
 
     def __init__(self, time_mask_param, num_masks=1, fill_value=0.0):
         """
-        time_mask_param: 마스킹 구간의 최대 폭(시간축에서)
-        num_masks: 몇 개의 마스크를 적용할지
-        fill_value: 마스킹 시 대체할 값
+        time_mask_param: maximum width of the masked segment (time axis)
+        num_masks: number of masks to apply
+        fill_value: value used to fill the masked region
         """
         self.time_mask_param = time_mask_param
         self.num_masks = num_masks
@@ -240,18 +242,21 @@ class SpecTimeMask(object):
 
 class SpecFreqMask(object):
     """
-    스펙트로그램 주파수축 일부 구간을 마스킹하는 증강 기법
+    Augmentation that masks a segment along the spectrogram's frequency axis.
+    Currently it's only ever used together with time masking (via
+    SpecAugmentMask) as the strong augmentation, so it isn't called on its
+    own — kept here for future standalone/combination experiments.
     x shape: (C, H, W)
-        C: 채널
-        H: 주파수 축
-        W: 시간 축
+        C: channel
+        H: frequency axis
+        W: time axis
     """
 
     def __init__(self, freq_mask_param, num_masks=1, fill_value=0.0):
         """
-        freq_mask_param: 마스킹 구간의 최대 폭(주파수 축에서)
-        num_masks:몇 개의 마스크를 적용할지
-        fill_value: 마스킹 시 대체할 값
+        freq_mask_param: maximum width of the masked segment (frequency axis)
+        num_masks: number of masks to apply
+        fill_value: value used to fill the masked region
         """
         self.freq_mask_param = freq_mask_param
         self.num_masks = num_masks
@@ -269,8 +274,9 @@ class SpecFreqMask(object):
 
 class SpecAugmentMask(object):
     """
-    SpecAugment-style 마스킹 증강
-    스펙트로그램의 시간축, 주파수축에 대해 각각 여러 개 구간을 마스킹
+    SpecAugment-style masking augmentation.
+    Masks several segments along both the time and frequency axes of the
+    spectrogram.
     """
 
     def __init__(self, freq_mask_param,
@@ -320,41 +326,12 @@ class Transform_MixMatch(object):
         return self.normalize(x_1), self.normalize(x_2)
 
 
-class _Transform_FixMatch(object):
-    """
-    FixMatch transform
-    weak transform / strong transform이 다름
-    """
-
-    def __init__(self, mean, std):
-        # weak transform
-        self.transform_w = tr.Compose([
-            AddGaussianNoise(mean=0, std=0.01),
-            SpecTimeMask(time_mask_param=10)
-        ])
-
-        # strong transform
-        self.transform_s = tr.Compose([
-            AddGaussianNoise(mean=0, std=0.05),
-            SpecAugmentMask(time_mask_param=20, freq_mask_param=20)
-        ])
-
-        self.normalize = lambda x: (x - mean) / (std + 1e-8)
-
-    def __call__(self, x):
-        weak_aug = self.transform_w(x)
-        strong_aug = self.transform_s(x)
-
-        w = self.normalize(weak_aug)
-        s = self.normalize(strong_aug)
-
-        return w, s
-
-
 class Transform_FixMatch(object):
     """
-    FixMatch transform
-    weak transform / strong transform이 다름
+    FixMatch transform: builds and returns a weak and a strong augmentation.
+    Order of operations is noise -> normalize -> mask, so that the 0.0 fill
+    value used by masking corresponds to the true mean in normalized space
+    (the standard SpecAugment convention).
     """
 
     def __init__(self, mean, std):
@@ -383,22 +360,13 @@ class Transform_FixMatch(object):
         return w, s
 
 
-class Transform_Proposed(object):
-    def __init__(self, mean, std):
-        self.transform = tr.Compose([
-            AddGaussianNoise(mean=0, std=0.01),
-            SpecTimeMask(time_mask_param=20),
-            # SpecAugmentMask(time_mask_param=10,freq_mask_param=10)
-        ])
-
-        self.normalize = lambda x: (x - mean) / (std + 1e-8)
-
-    def __call__(self, x):
-        aug1 = self.transform(x)
-        aug2 = self.transform(x)
-        return self.normalize(aug1), self.normalize(aug2)
-
 class Transform_Proposed_Multi(object):
+    """
+    Augmentation for the labeled data in the 'proposed' method.
+    Applies only time-axis masking (SpecTimeMask) to produce n_aug views.
+    Mask strength is controlled by args.lab_mask.
+    """
+
     def __init__(self, mean, std, mask, n_aug=2):
         self.n_aug = n_aug
         self.transform = tr.Compose([
@@ -411,6 +379,13 @@ class Transform_Proposed_Multi(object):
         return [self.normalize(self.transform(x)) for _ in range(self.n_aug)]
 
 class Transform_Proposed_ulb(object):
+    """
+    Augmentation for the unlabeled data in the 'proposed' method.
+    Applies both time- and frequency-axis masking (SpecAugmentMask) together,
+    a stronger augmentation than Transform_Proposed_Multi, to produce n_aug
+    views. Mask strength is controlled by args.unlab_mask.
+    """
+
     def __init__(self, mean, std, mask, n_aug=2):
         self.n_aug = n_aug
         self.transform = tr.Compose([
@@ -423,9 +398,28 @@ class Transform_Proposed_ulb(object):
     def __call__(self, x):
         return [self.normalize(self.transform(x)) for _ in range(self.n_aug)]
 
+class Transform_Proposed_NoAug(object):
+    """
+    Ablation variant for 'proposed' (--no-mask-aug): no noise, no masking —
+    just normalizes the raw spectrogram. Used for both labeled and unlabeled
+    data so Proposed_train can be compared against the same method with
+    augmentation disabled. n_aug defaults to 1 (not 2, like the augmented
+    transforms) since duplicating an identical unaugmented view would only
+    inflate the effective batch size without adding any signal.
+    """
+
+    def __init__(self, mean, std, n_aug=1):
+        self.n_aug = n_aug
+        self.normalize = lambda x: (x - mean) / (std + 1e-8)
+
+    def __call__(self, x):
+        return [self.normalize(x) for _ in range(self.n_aug)]
+
 def get_transform(args, mean, std):
     """
-    return train, unlab, val/test transform
+    Picks the (labeled transform, unlabeled transform, val/test transform)
+    combination that matches args.method. The unlabeled transform is unused
+    for pseudo/hcae/supervised, so it's filled with None or val_transform.
     """
     val_transform = tr.Compose([
         tr.Normalize(mean, std)
@@ -453,8 +447,13 @@ def get_transform(args, mean, std):
     elif method == 'simmatch':
         return basic_transform, Transform_FixMatch(mean, std), val_transform
     elif method == 'proposed':
-        # return Transform_Proposed(mean, std), Transform_Proposed_ulb(mean, std), val_transform
-        return Transform_Proposed_Multi(mean, std, lab_mask), Transform_Proposed_ulb(mean, std, unlab_mask), val_transform
+        if getattr(args, 'no_mask_aug', False):
+            # Ablation: no masking augmentation (and no noise, bundled with it)
+            return Transform_Proposed_NoAug(mean, std), Transform_Proposed_NoAug(mean, std), val_transform
+        n_aug = getattr(args, 'n_aug', 2)
+        return (Transform_Proposed_Multi(mean, std, lab_mask, n_aug=n_aug),
+                Transform_Proposed_ulb(mean, std, unlab_mask, n_aug=n_aug),
+                val_transform)
     else:
         return val_transform, val_transform, val_transform
 
@@ -463,10 +462,10 @@ def get_transform(args, mean, std):
 # 4. Data Loader
 ############################################################################
 def get_data(args, path_list):
-    # 1) 각 폴더에서 npz 파일 로드
-    data_dict, label_dict = load_npz_files(path_list, args.each_data_num)
+    # 1) Load npz files from each folder (loader is chosen automatically per dataset, see load_npz_files)
+    data_dict, label_dict = load_npz_files(args, path_list)
 
-    # 2) 각 type별로 셔플
+    # 2) Shuffle within each bearing type
     shuffle_data_dict, shuffle_label_dict = {}, {}
     for key in data_dict.keys():
         X = data_dict[key]
@@ -476,22 +475,22 @@ def get_data(args, path_list):
         shuffle_data_dict[key] = X[idx]
         shuffle_label_dict[key] = y[idx]
 
-    # 3) Slicing
+    # 3) Slice into train/test/val/unlabeled
     (train_data, test_data, val_data, unlabel_data,
      train_label, test_label, val_label, unlabel_label) = slice_data(args, shuffle_data_dict, shuffle_label_dict)
 
-    # 4) Concat
+    # 4) Concatenate bearing types back together
     X_train, y_train = concat_data(train_data, train_label)
     X_test, y_test = concat_data(test_data, test_label)
     X_val, y_val = concat_data(val_data, val_label)
     X_unlabel, y_unlabel = concat_data(unlabel_data, unlabel_label)
 
-    # 5) transform 구성
+    # 5) Build transforms
     mean, std = get_global_mean_std(X_train, X_unlabel)
 
     transform_labeled, transform_unlabeled, transform_val = get_transform(args, mean, std)
 
-    # 6) Dataset 생성
+    # 6) Build datasets
     if args.method == 'supervised':
         trainset = BearingDataset(X_train, y_train, transform=transform_labeled)
         valset = BearingDataset(X_val, y_val, transform=transform_val)

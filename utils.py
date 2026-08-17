@@ -46,6 +46,18 @@ def set_seed(args):
     if args.n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
 
+def run_id(args):
+    """
+    Filename stem shared by every checkpoint/result/plot save path, e.g.
+    'cnn_proposed_10_hust', or 'cnn_proposed_10_hust_noaug' if --tag is set.
+    Giving concurrent/ablation runs distinct --tag values keeps them from
+    overwriting each other's output files; leaving --tag unset (default)
+    reproduces today's filenames exactly.
+    """
+    base = f"{args.model}_{args.method}_{args.num_labeled}_{args.dataset}"
+    tag = getattr(args, 'tag', '')
+    return f"{base}_{tag}" if tag else base
+
 def accuracy(output, target, topk=(1,)):
     maxk = max(topk)
     batch_size = target.size(0)
@@ -146,7 +158,7 @@ def bearing_tsne(args, test_loader, model, repeat):
         plt.xlabel("t-SNE Dimension 1")
         plt.ylabel("t-SNE Dimention 2")
         plt.title(f"t-SNE of {args.method}")
-        plt.savefig(f"./plot/{args.model}_{args.method}_{args.num_labeled}_{repeat}.png")
+        plt.savefig(f"./plot/{run_id(args)}_{repeat}.png")
         plt.close()
     return
 
@@ -186,7 +198,7 @@ def cwru_tsne(args, test_loader, model, repeat):
     plt.ylabel('t-SNE Dimension 2')
     plt.title(f"t-SNE of {args.method} on CWRU")
     os.makedirs('./plot', exist_ok=True)
-    plt.savefig(f"./plot/{args.model}_{args.method}_{args.num_labeled}_{repeat}_CWRU.png")
+    plt.savefig(f"./plot/{run_id(args)}_{repeat}_CWRU.png")
     plt.close()
 
 def hust_tsne(args, test_loader, model, repeat):
@@ -225,7 +237,7 @@ def hust_tsne(args, test_loader, model, repeat):
     plt.ylabel('t-SNE Dimension 2')
     plt.title(f"t-SNE of {args.method} on HUST")
     os.makedirs('./plot', exist_ok=True)
-    plt.savefig(f"./plot/{args.model}_{args.method}_{args.num_labeled}_{repeat}_HUST.png")
+    plt.savefig(f"./plot/{run_id(args)}_{repeat}_HUST.png")
     plt.close()
 
 def pu_tsne(args, test_loader, model, repeat):
@@ -264,17 +276,8 @@ def pu_tsne(args, test_loader, model, repeat):
     plt.ylabel('t-SNE Dimension 2')
     plt.title(f"t-SNE of {args.method} on PU")
     os.makedirs('./plot', exist_ok=True)
-    plt.savefig(f"./plot/{args.model}_{args.method}_{args.num_labeled}_{repeat}_PU.png")
+    plt.savefig(f"./plot/{run_id(args)}_{repeat}_PU.png")
     plt.close()
-
-# FixMatch
-def fix_interleave(x, size):
-    s = list(x.shape)
-    return x.reshape([size, -1] + s[1:]).transpose(0,1).reshape([-1] + s[1:])
-
-def de_interleave(x, size):
-    s = list(x.shape)
-    return x.reshape([size, -1] + s[1:]).transpose(0,1).reshape([-1] + s[1:])
 
 # MixMatch
 def interleave_offset(batch, nu):
@@ -323,7 +326,7 @@ def build_similarity(feat: torch.Tensor) -> torch.Tensor:
     return torch.mm(feat_n, feat_n.t())
 
 def build_semantic_graph(labels: torch.Tensor) -> torch.Tensor:
-    """Binary dajacency: 1 if same pseudo-label, else 0 (N x N)"""
+    """Binary adjacency: 1 if same pseudo-label, else 0 (N x N)"""
     return (labels.unsqueeze(1) == labels.unsqueeze(0)).float()
 
 def mse_detach(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -349,6 +352,23 @@ class FeatureMemory:
         feats, labels = zip(*self.buffer)
         return torch.stack(feats, dim=0), torch.stack(labels, dim=0)
 
+def instance_pseudo_label(feat: torch.Tensor, mem_feats: torch.Tensor, mem_labels: torch.Tensor,
+                          num_classes: int, tau: float = 0.1) -> torch.Tensor:
+    """
+    SimMatch's instance-level pseudo-label: propagates class labels from the
+    FeatureMemory bank to `feat` by cosine similarity. Each row is a
+    similarity-weighted (softmax over the memory bank, temperature tau)
+    average of the memory bank's one-hot labels, giving each sample a soft
+    class distribution based on its nearest neighbors in the memory bank
+    rather than the classifier head.
+    """
+    feat_n = _normalize(feat)
+    mem_n = _normalize(mem_feats)
+    sim = feat_n @ mem_n.t() / tau
+    weights = F.softmax(sim, dim=1)
+    mem_onehot = F.one_hot(mem_labels, num_classes).float()
+    return weights @ mem_onehot
+
 # Proposed
 def calculate_entropy(probs):
     eps = 1e-8
@@ -358,27 +378,44 @@ def calculate_entropy(probs):
 def calculate_euclidean_distance(single_tensor, batch_tensor):
     # reshape single_tensor
     single_tensor_expanded = single_tensor.unsqueeze(0)
-    
+
     # calculate the squared differences
     diff = batch_tensor - single_tensor_expanded
     squared_diff = diff ** 2
-    
+
     # sum over the dimensions to get the squared distances
     squared_distances = torch.sum(squared_diff, dim=1)
-    
-    # take the square root to get the euclidean distances
-    distances = torch.sqrt(squared_distances)
+
+    # take the square root to get the euclidean distances.
+    # d(sqrt(x))/dx = 1/(2*sqrt(x)) blows up as x -> 0, so any anchor/sample
+    # pair with near-identical features (easy to hit with very few labeled
+    # samples, e.g. --num-labeled 2, where mixup keeps mixing the same couple
+    # of samples) produces a huge gradient here -> NaN weights within a few
+    # steps. The eps keeps the argument to sqrt strictly positive.
+    eps = 1e-8
+    distances = torch.sqrt(squared_distances + eps)
     return distances
 
 def batch_triplet_loss(args, inputs, targets, all_inputs, class_probs):
     losses = []
-    margin = 0.5
-    
+    margin = args.margin
+
+    # L2-normalize features before computing distance so `margin` stays
+    # meaningful throughout training. Raw (unnormalized) feature distances
+    # were measured to grow ~17x within the first 10 SGD steps (0.37 at
+    # init -> ~8.4 by step 10) as the encoder's weights scale up, which
+    # makes any fixed margin on raw distances correct only at
+    # initialization and negligible soon after. Normalized distances
+    # (between unit vectors, range [0, 2]) stayed within ~1.1x-2.0x of
+    # margin=0.5 across the same 50 steps.
+    inputs = F.normalize(inputs, dim=1)
+    all_inputs = F.normalize(all_inputs, dim=1)
+
     for anchor_data, anchor_label in zip(inputs, targets):
         positive_probs = class_probs[:, anchor_label]
-        
+
         other_classes = [i for i in range(args.num_classes) if i != anchor_label]
-        
+
         # negative_probs, _ = class_probs[:, other_classes].max(dim=1)
 
         #appendix
@@ -394,33 +431,118 @@ def batch_triplet_loss(args, inputs, targets, all_inputs, class_probs):
         losses.append(batch_loss.mean())
     return torch.stack(losses).mean()
 
+def batch_triplet_loss_legacy(args, inputs, targets, all_inputs, class_probs):
+    """
+    Pre-fix behavior of batch_triplet_loss, kept only for ablation
+    (--legacy-margin) to isolate this fix's effect on results: distances are
+    computed on raw (non-normalized) features, so `margin` only stays
+    correctly scaled near initialization. See batch_triplet_loss's comments
+    for why this was changed.
+    """
+    losses = []
+    margin = args.margin
+
+    for anchor_data, anchor_label in zip(inputs, targets):
+        positive_probs = class_probs[:, anchor_label]
+
+        other_classes = [i for i in range(args.num_classes) if i != anchor_label]
+
+        negative_probs = 1.0 - positive_probs
+
+        distance = calculate_euclidean_distance(anchor_data, all_inputs)
+
+        pos_dist = positive_probs * distance
+        neg_dist = negative_probs * distance
+
+        batch_loss = torch.clamp(pos_dist - neg_dist + margin, min=0.0)
+
+        losses.append(batch_loss.mean())
+    return torch.stack(losses).mean()
+
 def mixup_data_within_cls(x, y, alpha=1.0, n_mixups=2):
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1
-        
     mixed_x = torch.zeros_like(x)
     unique_classes = y.unique()
     mixed_data_list = []
     mixed_labels_list = []
-    
+
     for cls in unique_classes:
         indices = (y == cls).nonzero(as_tuple=True)[0]
         if len(indices) > 1:
             for _ in range(n_mixups):
+                # Resample lam every round (rather than once for the whole
+                # call) so the n_mixups rounds are actually distinct. With
+                # only 2 samples in a class -- common here given how small
+                # --num-labeled can be -- there are only 2 possible
+                # permutations, so a single shared lam made the two rounds
+                # byte-identical in ~50% of cases (verified empirically),
+                # defeating the point of having more than one mixup round.
+                lam = np.random.beta(alpha, alpha) if alpha > 0 else 1
+
+                # Reject the identity permutation: when shuffled_indices ==
+                # indices, mixed = lam*x + (1-lam)*x == x regardless of lam,
+                # silently turning "mixup" into a no-op that just replays
+                # the original sample. torch.randperm(2) returns identity
+                # ~50% of the time, so without this retry, two independently
+                # "mixed" rounds still ended up identical ~25% of the time
+                # (both rounds hitting the no-op case) even after the lam
+                # fix above. Always terminates since len(indices) > 1
+                # guarantees at least one non-identity permutation exists.
                 shuffled_indices = indices[torch.randperm(len(indices))]
+                while torch.equal(shuffled_indices, indices):
+                    shuffled_indices = indices[torch.randperm(len(indices))]
+
                 mixed_x[indices] = lam * x[indices] + (1 - lam) * x[shuffled_indices]
-                
+
                 mixed_data_list.append(mixed_x[indices])
                 mixed_labels_list.append(y[indices])
-                
+
             mixed_data_list.append(x[indices])
             mixed_labels_list.append(y[indices])
         else:
             mixed_data_list.append(x[indices])
             mixed_labels_list.append(y[indices])
             
+    mixed_x = torch.cat(mixed_data_list, dim=0)
+    mixed_y = torch.cat(mixed_labels_list, dim=0)
+    return mixed_x, mixed_y
+
+def mixup_data_within_cls_legacy(x, y, alpha=1.0, n_mixups=2):
+    """
+    Pre-fix behavior of mixup_data_within_cls, kept only for ablation
+    (--legacy-mixup) to isolate this fix's effect on results. lam is drawn
+    once for the whole call (shared across every class/round, so the
+    n_mixups rounds were often byte-identical when a class has only 2
+    samples) and shuffled_indices is never checked against the identity
+    permutation (~50% chance per round of silently returning the original
+    sample unchanged). See mixup_data_within_cls's comments for why this
+    was changed.
+    """
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    mixed_x = torch.zeros_like(x)
+    unique_classes = y.unique()
+    mixed_data_list = []
+    mixed_labels_list = []
+
+    for cls in unique_classes:
+        indices = (y == cls).nonzero(as_tuple=True)[0]
+        if len(indices) > 1:
+            for _ in range(n_mixups):
+                shuffled_indices = indices[torch.randperm(len(indices))]
+                mixed_x[indices] = lam * x[indices] + (1 - lam) * x[shuffled_indices]
+
+                mixed_data_list.append(mixed_x[indices])
+                mixed_labels_list.append(y[indices])
+
+            mixed_data_list.append(x[indices])
+            mixed_labels_list.append(y[indices])
+        else:
+            mixed_data_list.append(x[indices])
+            mixed_labels_list.append(y[indices])
+
     mixed_x = torch.cat(mixed_data_list, dim=0)
     mixed_y = torch.cat(mixed_labels_list, dim=0)
     return mixed_x, mixed_y

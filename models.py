@@ -1,3 +1,19 @@
+"""
+Model definitions for the SSL bearing fault diagnosis pipeline.
+
+This module provides:
+    - Plain CNN classifiers (CNN_128, CNN_64) for STFT-image inputs of
+      different resolutions (SLRA uses 128x128, CWRU/HUST/PU use 64x64)
+    - WideResNet, an alternative backbone selectable via --model wrn
+    - Convolutional autoencoder classifiers (CAE_128, CAE_64) used by the
+      'hcae' semi-supervised method, which jointly reconstructs unlabeled
+      inputs and classifies labeled ones
+    - ModelEMA, an exponential moving average shadow model used for
+      evaluation/inference stability across all training methods
+    - create_model(args), the single entry point main.py uses to build the
+      right backbone for the chosen dataset/model/method combination
+"""
+
 import math
 from copy import deepcopy
 
@@ -8,6 +24,8 @@ import torch.nn.functional as F
 
 ################### CNN
 class CNN_128(nn.Module):
+    """CNN classifier for 128x128 STFT inputs (used with the 'slra' dataset)."""
+
     def __init__(self, num_classes):
         super(CNN_128, self).__init__()
         self.features = nn.Sequential(
@@ -36,37 +54,14 @@ class CNN_128(nn.Module):
         x = self.features(x)
         x = x.view(-1, 128 * 8 * 8)
         x = self.classifier(x)
+        # returns (penultimate feature, class logits) — the feature is used
+        # for t-SNE visualization and by the 'proposed' method's triplet loss
         return x, self.fc(x)
 
-
-class _CNN_64(nn.Module):
-    def __init__(self, num_classes):
-        super(CNN_64, self).__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(1, 32, 5, padding=2),
-            nn.LeakyReLU(),
-            nn.MaxPool2d(2, 2),
-
-            nn.Conv2d(32, 64, 5, padding=2),
-            nn.LeakyReLU(),
-            nn.MaxPool2d(2, 2),
-
-            nn.Conv2d(64, 128, 5, padding=2),
-            nn.LeakyReLU(),
-            nn.MaxPool2d(2, 2))
-
-        self.classifier = nn.Sequential(
-            nn.Linear(128 * 8 * 8, 1024), nn.LeakyReLU(),
-            nn.Linear(1024, 256), nn.LeakyReLU())
-        self.fc = nn.Linear(256, num_classes)
-
-    def forward(self, x):
-        x = self.features(x)
-        x = x.view(-1, 128 * 8 * 8)
-        x = self.classifier(x)
-        return x, self.fc(x)
 
 class CNN_64(nn.Module):
+    """CNN classifier for 64x64 STFT inputs (used with 'slra'/'cwru'/'hust'/'pu')."""
+
     def __init__(self, num_classes):
         super(CNN_64, self).__init__()
         self.features = nn.Sequential(
@@ -93,53 +88,11 @@ class CNN_64(nn.Module):
         x = self.classifier(x)
         return x, self.fc(x)
 
-# CNN + Attention
-class AttentionCNN_64(nn.Module):
-    def __init__(self, num_classes):
-        super(AttentionCNN_64, self).__init__()
-
-        self.feature = nn.Sequential(
-            nn.Conv2d(1, 32, 5, padding=2),
-            nn.Tanh(),
-            nn.MaxPool2d(2,2),
-
-            nn.Conv2d(32, 64, 5, padding=2),
-            nn.Tanh(),
-            nn.MaxPool2d(2,2),
-
-            nn.Conv2d(64, 128, 5, padding=2),
-            nn.Tanh(),
-            nn.MaxPool2d(2,2)
-        )
-
-        self.attention = nn.Sequential(
-            nn.Conv2d(128, 1, kernel_size=1),
-            nn.Sigmoid()
-        )
-
-        self.classifier = nn.Sequential(
-            nn.Linear(128 * 8 * 8, 1024), nn.Tanh(),
-            nn.Linear(1024, 256), nn.Tanh()
-        )
-
-        self.fc = nn.Linear(256, num_classes)
-
-    def forward(self, x):
-        feature_map = self.feature(x)
-
-        attention_map = self.attention(feature_map)
-
-        attended_features = feature_map * attention_map
-
-        x = attended_features.view(-1, 128 * 8 * 8)
-
-        x = self.classifier(x)
-
-        return x, self.fc(x)
-
 
 ########################WRN
 class BasicBlock(nn.Module):
+    """Pre-activation residual block used to build WideResNet."""
+
     def __init__(self, in_planes, out_planes, stride, dropRate=0.0, activate_before_residual=False):
         super(BasicBlock, self).__init__()
         self.bn1 = nn.BatchNorm2d(in_planes, momentum=0.001)
@@ -169,6 +122,7 @@ class BasicBlock(nn.Module):
 
 
 class NetworkBlock(nn.Module):
+    """Stack of `nb_layers` BasicBlocks; the building unit of each WideResNet stage."""
 
     def __init__(self, nb_layers, in_planes, out_planes, block, stride, dropRate=0.0, activate_before_residual=False):
         super(NetworkBlock, self).__init__()
@@ -187,6 +141,8 @@ class NetworkBlock(nn.Module):
 
 
 class WideResNet(nn.Module):
+    """WideResNet-28-2 backbone, selectable via --model wrn (SLRA/128x128 only)."""
+
     def __init__(self, num_classes, depth=28, widen_factor=2, dropRate=0.0):
         super(WideResNet, self).__init__()
         nChannels = [16, 16 * widen_factor, 32 * widen_factor, 64 * widen_factor]
@@ -231,29 +187,15 @@ class WideResNet(nn.Module):
         return out, self.fc(out)
 
 
-class WeightEMA(object):
-    def __init__(self, model, ema_model, alpha, lr):
-        self.model = model
-        self.ema_model = ema_model
-        self.alpha = alpha
-        self.params = list(model.state_dict().values())
-        self.ema_params = list(ema_model.state_dict().values())
-        self.wd = 0.02 * lr
-
-        for param, ema_param in zip(self.params, self.ema_params):
-            param.data.copy_(ema_param.data)
-
-    def step(self):
-        one_minus_alpha = 1.0 - self.alpha
-        for param, ema_param in zip(self.params, self.ema_params):
-            if ema_param.dtype == torch.float32:
-                ema_param.mul_(self.alpha)
-                ema_param.add(param * one_minus_alpha)
-
-                param.mul_(1 - self.wd)
-
-
 class ModelEMA(object):
+    """
+    Exponential moving average of model weights.
+
+    Kept as a separate deep-copied model (`self.ema`) that is updated after
+    every optimizer step; args.use_ema controls whether this shadow model
+    (rather than the live model) is used for validation/testing/checkpointing.
+    """
+
     def __init__(self, args, model, decay):
         self.ema = deepcopy(model)
         self.ema.to(args.device)
@@ -289,6 +231,13 @@ class ModelEMA(object):
 
 ###########################################HCAE
 class CAE_128(nn.Module):
+    """
+    Convolutional autoencoder + classifier for 128x128 inputs, used by the
+    'hcae' method: forward() returns (reconstruction, class logits) so the
+    same model can be trained with a reconstruction loss on unlabeled data
+    and a classification loss on labeled data.
+    """
+
     def __init__(self, num_classes):
         super(CAE_128, self).__init__()
         self.features = nn.Sequential(
@@ -351,6 +300,8 @@ class CAE_128(nn.Module):
 
 
 class CAE_64(nn.Module):
+    """Same as CAE_128 but sized for 64x64 inputs (CWRU/HUST/PU datasets)."""
+
     def __init__(self, num_classes):
         super(CAE_64, self).__init__()
 
@@ -402,18 +353,21 @@ class CAE_64(nn.Module):
         return recon, y
 
 def create_model(args):
-    if args.dataset == 'slra':
-        if args.model == 'cnn':
-            if args.method == 'hcae':
-                model = CAE_128(num_classes=args.num_classes)
-            else:
-                model = CNN_128(num_classes=args.num_classes)
-        elif args.model == 'wrn':
-            model = WideResNet(num_classes=args.num_classes)
+    """
+    Build the backbone selected by args.dataset/args.model/args.method.
+
+    All datasets now use 64x64 STFT inputs, so CNN_64/CAE_64 is the default
+    backbone everywhere. WideResNet (--model wrn) is available for 'slra'.
+    The 'hcae' method always uses the CAE_64 autoencoder variant regardless
+    of --model. (CNN_128/CAE_128 are kept in this file for 128x128 STFT
+    inputs, unused now that 'slra' switched to 64x64 — see get_data() /
+    main.py's data_path for 'slra' if that ever changes back.)
+    """
+    if args.dataset == 'slra' and args.model == 'wrn':
+        model = WideResNet(num_classes=args.num_classes)
+    elif args.method == 'hcae':
+        model = CAE_64(num_classes=args.num_classes)
     else:
-        if args.method == 'hcae':
-            model = CAE_64(num_classes=args.num_classes)
-        else:
-            model = CNN_64(num_classes=args.num_classes)
+        model = CNN_64(num_classes=args.num_classes)
     model = model.to(args.device)
     return model
